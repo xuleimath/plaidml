@@ -17,7 +17,7 @@ int main(int argc, char **argv) {
       pmlc::rt::opencl::getSupportedDevices();
   if (supportedDevices.empty()) {
     std::cout << "No supported OpenCL devices available" << std::endl;
-    return 0;
+    return 1;
   }
 
   std::cout << "Available OpenCL devices: " << std::endl;
