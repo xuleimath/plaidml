@@ -26,6 +26,7 @@ plaidml_cc_library(
         "execenv_coalescing.cc",
         "pass_detail.h",
         "minimize_allocations.cc",
+        "recalculate_event_deps.cc",
     ],
     hdrs = [
         "passes.h",

@@ -123,6 +123,7 @@ void pipelineBuilder(OpPassManager &pm) {
       comp::ExecEnvRuntime::OpenCL, /*memorySpace=*/11));
   pm.addPass(comp::createExecEnvCoalescingPass());
   pm.addPass(comp::createMinimizeAllocationsPass());
+  pm.addPass(comp::createRecalculateEventDepsPass(/*safeDealloc=*/false));
 
   // GPU to SPIR-V.
   pm.addPass(createLegalizeStdOpsForSPIRVLoweringPass());

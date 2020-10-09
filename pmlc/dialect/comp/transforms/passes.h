@@ -15,6 +15,9 @@ std::unique_ptr<mlir::Pass> createExecEnvCoalescingPass();
 
 std::unique_ptr<mlir::Pass> createMinimizeAllocationsPass();
 
+std::unique_ptr<mlir::Pass> createRecalculateEventDepsPass();
+std::unique_ptr<mlir::Pass> createRecalculateEventDepsPass(bool safeDealloc);
+
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION
 #include "pmlc/dialect/comp/transforms/passes.h.inc"

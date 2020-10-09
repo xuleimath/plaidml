@@ -45,4 +45,13 @@ def MinimizeAllocations : FunctionPass<"comp-minimize-allocations"> {
   let constructor = "pmlc::dialect::comp::createMinimizeAllocationsPass()";
 }
 
+def RecalculateEventDeps : FunctionPass<"comp-recalc-event-deps"> {
+  let summary = "Recalculate event dependencies based on data dependencies";
+  let constructor = "pmlc::dialect::comp::createRecalculateEventDepsPass()";
+  let options = [
+    Option<"safeDealloc", "safe-dealloc", "bool", /*default*/"true",
+           "Explicitly wait for execution on memory to finish before dealloc">
+  ];
+}
+
 #endif // __PMLC_DIALECT_COMP_TRANSFORMS__
