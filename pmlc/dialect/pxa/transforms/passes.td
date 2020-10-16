@@ -81,7 +81,7 @@ def CPUThread : FunctionPass<"pxa-cpu-thread"> {
   let summary = "Tile outmost loops for CPU threading";
   let constructor = "pmlc::dialect::pxa::createCPUThreadPass()";
   let options = [
-    Option<"threads", "threads", "unsigned", 
+    Option<"threads", "threads", "unsigned",
            /*default=*/"std::thread::hardware_concurrency()",
            "Set maximum/goal inner threads">
   ];
@@ -158,6 +158,11 @@ def Vectorize : FunctionPass<"pxa-vectorize"> {
     Option<"vectorWidth", "width", "unsigned", /*default=*/"8",
            "Vector register size in elements">
   ];
+}
+
+def ReorderLayout : FunctionPass<"pxa-reorder-layout"> {
+  let summary = "TODO";
+  let constructor = "pmlc::dialect::pxa::createReorderLayoutPass()";
 }
 
 #endif // __PMLC_DIALECT_PXA_PASSES__

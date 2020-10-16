@@ -34,6 +34,7 @@ plaidml_cc_library(
         "nest_loops.cc",
         "normalize.cc",
         "pass_detail.h",
+        "reorder_layout.cc",
         "resize_tmps.cc",
         "stencil.cc",
         "stencil_gemm.cc",
