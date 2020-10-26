@@ -31,7 +31,7 @@ struct StdxSubgroupBroadcastOpConversion final
                   ConversionPatternRewriter &rewriter) const final {
     auto stdxType = op.getResult().getType();
     auto spirvType = typeConverter.convertType(stdxType);
-    rewriter.replaceOpWithNewOp<spirv::GroupNonUniformBroadcastOp>(
+    rewriter.replaceOpWithNewOp<spirv::GroupBroadcastOp>(
         op, spirvType, spirv::Scope::Subgroup, operands[0], operands[1]);
 
     return success();

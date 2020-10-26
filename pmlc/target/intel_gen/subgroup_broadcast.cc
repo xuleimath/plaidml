@@ -31,7 +31,7 @@ private:
 
 public:
   DevectorizeImpl(scf::ParallelOp loop, unsigned vectorSize, bool useBlockOps)
-      : loop(loop), vectorSize(vectorSize), useBlockOps(useBlockOps) {}
+      : loop(loop), vectorSize(vectorSize), useBlockOps(false) {}
 
   bool isVectorTypeValid(VectorType type) {
     return type.getRank() == 1 && type.getDimSize(0) == vectorSize;
