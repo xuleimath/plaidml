@@ -1,20 +1,28 @@
-// Copyright 2020 Intel Corporation
+// Copyright 2020, Intel Corporation
 
 #include <numeric>
 #include <vector>
 
+#include "mlir/Analysis/AffineStructures.h"
 #include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
-#include "mlir/IR/IntegerSet.h"
+#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/DebugStringHelper.h"
 #include "llvm/ADT/SetOperations.h"
+#include "llvm/ADT/TypeSwitch.h"
 
+#include "pmlc/dialect/pxa/analysis/affine_constraints.h"
+#include "pmlc/dialect/pxa/analysis/uses.h"
 #include "pmlc/dialect/pxa/ir/interfaces.h"
+#include "pmlc/dialect/pxa/ir/ops.h"
+#include "pmlc/dialect/pxa/transforms/layout_utils.h"
 #include "pmlc/dialect/pxa/transforms/pass_detail.h"
 #include "pmlc/dialect/pxa/transforms/passes.h"
 #include "pmlc/util/logging.h"
+#include "pmlc/util/tags.h"
 
 namespace pmlc::dialect::pxa {
 
@@ -101,14 +109,17 @@ struct MemoryReadDesc {
   // Affine map of read operation.
   mlir::AffineMap readMap;
   // Vectorization of read operation.
-  mlir::SmallVector<uint64_t, 4> readVector;
-  // Lower bounds of input dimensions in `readMap`.
-  mlir::SmallVector<uint64_t, 6> dimensionLowerBounds;
-  // Upper bounds of input dimensions in `readMap`.
-  mlir::SmallVector<uint64_t, 6> dimensionUpperBounds;
+  mlir::SmallVector<int64_t, 4> readVector;
+  // Constraints for dimensions of `readMap`.
+  mlir::FlatAffineConstraints dimensionConstraints;
   // Iteration order for input dimensions in `readMap`
   // (from least to most frequent).
   mlir::SmallVector<unsigned, 6> iterationOrder;
+};
+
+/// Structure holding information about single write operation.
+struct MemoryWriteDesc {
+  mlir::SmallVector<int64_t, 4> writeVector;
 };
 
 /// Structure describing memory and its usage.
@@ -116,13 +127,20 @@ struct MemoryUsageDesc {
   // IR value representing memory.
   mlir::Value value;
   // Shape of memory.
-  mlir::SmallVector<uint64_t, 4> shape;
-  // List of read descriptions accessing memory.
+  mlir::SmallVector<int64_t, 4> shape;
+  // List of descriptions of reads accessing memory.
   mlir::SmallVector<MemoryReadDesc, 1> reads;
+  // List of descriptions of writes accessing memory.
+  mlir::SmallVector<MemoryWriteDesc, 1> writes;
+  // Number of elements in memory.
+  int64_t count;
 };
 
 /// Gathers information about specified read operation.
 MemoryReadDesc gatherReadDesc(PxaReadOpInterface op);
+
+/// Gathers information about specified write operation.
+MemoryWriteDesc gatherWriteDesc(PxaReduceOpInterface op);
 
 /// Returns MemoryUsageDesc initialized with information about `memory`,
 /// without any information about its usage.
@@ -131,26 +149,11 @@ MemoryUsageDesc getEmptyUsageDesc(mlir::Value memory);
 /// Returns whether it is worth to change layout for given read operation.
 /// In general it checks whether number of elements read is more than number
 /// of elements memory holds.
-bool isReadWorthLayoutChange(MemoryReadDesc &desc, uint64_t totalSize);
+bool isReadWorthLayoutChange(MemoryReadDesc &desc, int64_t totalSize);
 
 /// Returns whether any of read operations on memory make layout change
 /// worth it.
 bool isMemoryWorthLayoutChange(MemoryUsageDesc &desc);
-
-/// Structure describing layout change in terms of affine map from previous
-/// layout to new one. Additionally it holds shape and vectorization
-/// of reordered memory as extracting this information from affine map
-/// is not trivial.
-struct ReorderDesc {
-  // Map from original memory layout into target layout.
-  mlir::AffineMap reorderMap;
-  // Shape of memory after performing layout change.
-  mlir::SmallVector<uint64_t, 6> reorderedShape;
-  // Vectorization of memory after layout change. It has same number of
-  // elements as original vectorization, but vectorized dimensions may
-  // be moved to rightmost place.
-  mlir::SmallVector<uint64_t, 6> reorderedVector;
-};
 
 /// Generates layout change that tries to match order of elements in memory
 /// to order of iteration.
@@ -162,8 +165,7 @@ struct ReorderDesc {
 ///    are separated as non-empty dimensions not depending on any loop variable.
 /// 2. Permuting/sorting separated dimensions in order of loops whose variables
 ///    are used in each dimension.
-mlir::Optional<ReorderDesc>
-generateLayoutChange(const MemoryUsageDesc &memoryDesc);
+mlir::Optional<ReorderDesc> generateLayoutChange(MemoryUsageDesc &memoryDesc);
 
 /// Inserts layout change into IR, replacing previous read and write operations.
 /// If some write cannot be replaced, separate operation performing "reorder"
@@ -179,26 +181,12 @@ generateLayoutChange(const MemoryUsageDesc &memoryDesc);
 ///    `affine.parallel` writing to old memory, that copies it into memory
 ///     with new layout.
 /// 5. If all writes were replaced and old memory is no longer used, remove it.
-void foldOrCreateReorder(const MemoryUsageDesc &memoryDesc,
-                         const ReorderDesc &reorderDesc);
+void foldOrCreateReorder(MemoryUsageDesc &memoryDesc, ReorderDesc &reorderDesc,
+                         bool allowReorder);
 
 // ============================================================================
 // Helper affine map transformations
 // ============================================================================
-
-/// Simplify affine map given integral constraints. Returns the same map if it
-/// cannot be simplified further.
-///
-/// Input:
-///   map         = (d0, d1) -> (d0 + d1,
-///                              (d0 * 16 + d1 * 8) floordiv 8 floordiv 2,
-///                              (d0 * 16 + d1 * 8) floordiv 8 % 2, 0)
-///   constraints = {0 <= d1 < 2, 0 <= d0 < 6}
-///
-/// Output:
-///   (d0, d1) -> (d0 + d1, d0, d1, 0)
-mlir::AffineMap simplifyConstrainedAffineMap(mlir::AffineMap map,
-                                             mlir::IntegerSet constraints);
 
 /// Expand affine map dimensions based on integral constraints and vector shape.
 /// Aim of this transformation is to separate vector dimension and reduce
@@ -218,9 +206,8 @@ mlir::AffineMap simplifyConstrainedAffineMap(mlir::AffineMap map,
 /// Note: to obtain affine map from input space to expanded space composition
 ///       A o B can be used (with simplification).
 /// A o B = (d0, d1) -> (d0 + d1, d0, d1, 0)
-ReorderDesc expandAffineMap(mlir::AffineMap map, mlir::ArrayRef<uint64_t> shape,
-                            mlir::ArrayRef<uint64_t> vector,
-                            mlir::IntegerSet constraints);
+ReorderDesc expandAffineMap(mlir::AffineMap map, mlir::ArrayRef<int64_t> vector,
+                            mlir::FlatAffineConstraints &constraints);
 
 /// Create affine permutation map that sorts resulting space dimensions in order
 /// of increasing schedule.
@@ -245,9 +232,9 @@ ReorderDesc expandAffineMap(mlir::AffineMap map, mlir::ArrayRef<uint64_t> shape,
 /// Note: to obtain affine map from input space to sorted space composition
 ///       A o B can be used.
 ///   A o B = (d0, d1) -> (d1, d0 + d1, d0, 0)
-ReorderDesc sortAffineMap(mlir::AffineMap map, mlir::ArrayRef<uint64_t> shape,
-                          mlir::ArrayRef<uint64_t> vector,
-                          mlir::ArrayRef<unsigned> schedule);
+mlir::AffineMap sortAffineMap(mlir::AffineMap map,
+                              mlir::ArrayRef<int64_t> vector,
+                              mlir::ArrayRef<unsigned> schedule);
 
 /// Tile affine map using integral constraints to optimize specified schedule.
 /// Returns llvm::None if current affine map is already optimal.
@@ -269,11 +256,11 @@ ReorderDesc sortAffineMap(mlir::AffineMap map, mlir::ArrayRef<uint64_t> shape,
 /// Note: to obtain affine map from input space to tiled space composition
 ///       A o B can be used (with simplification).
 ///   A o B = (d0, d1) -> (d1, d0 + d1, d0, 0)
-mlir::Optional<ReorderDesc> tileAffineMap(mlir::AffineMap map,
-                                          mlir::ArrayRef<uint64_t> shape,
-                                          mlir::ArrayRef<uint64_t> vector,
-                                          mlir::IntegerSet constraints,
-                                          mlir::ArrayRef<unsigned> schedule);
+mlir::Optional<ReorderDesc>
+tileAffineMap(mlir::AffineMap map, mlir::ArrayRef<int64_t> shape,
+              mlir::ArrayRef<int64_t> vector,
+              mlir::FlatAffineConstraints constraints,
+              mlir::ArrayRef<unsigned> schedule);
 
 // =============================================================================
 // Implementation
@@ -284,76 +271,78 @@ void ReorderLayoutPass::runOnFunction() {
   // Gather read operations with memory not local to loop.
   mlir::DenseMap<mlir::Value, mlir::SmallVector<PxaReadOpInterface, 1>>
       valueReadListMap;
+  mlir::DenseMap<mlir::Value, mlir::SmallVector<PxaReduceOpInterface, 1>>
+      valueReduceListMap;
   for (auto parallelOp : func.getOps<mlir::AffineParallelOp>()) {
     mlir::Region &body = parallelOp.getLoopBody();
     parallelOp.walk([&](PxaReadOpInterface read) {
-      mlir::AffineMap map = read.getAffineMap();
       mlir::Value memRef = read.getMemRef();
-      mlir::Region *memParent = memRef.getParentRegion();
+      mlir::Value indirectDef = getIndirectDef(memRef);
       // Skip memory local to `affine.parallel`.
-      if (memParent == &body || body.isProperAncestor(memParent))
+      if (!parallelOp.isDefinedOutsideOfLoop(indirectDef))
         return;
-      valueReadListMap[memRef].push_back(read);
+      valueReadListMap[indirectDef].push_back(read);
+    });
+    parallelOp.walk([&](PxaReduceOpInterface reduce) {
+      mlir::Value memRef = reduce.getMemRef();
+      mlir::Value indirectDef = getIndirectDef(memRef);
+      // Skip memory local to `affine.parallel`.
+      if (!parallelOp.isDefinedOutsideOfLoop(indirectDef))
+        return;
+      valueReduceListMap[indirectDef].push_back(reduce);
     });
   }
   // Gather descriptions and reject memory not worth changing layout.
   std::vector<MemoryUsageDesc> worthLayoutChange;
   for (auto &valueReadListPair : valueReadListMap) {
-    // For now ignore memory with more than one usage to simplify the algorithm.
-    if (valueReadListPair.second.size() != 1)
-      continue;
-    MemoryUsageDesc memoryDesc = getEmptyUsageDesc(valueReadListPair.first);
+    mlir::Value memory = valueReadListPair.first;
+    MemoryUsageDesc memoryDesc = getEmptyUsageDesc(memory);
     for (PxaReadOpInterface read : valueReadListPair.second)
       memoryDesc.reads.emplace_back(gatherReadDesc(read));
+    for (PxaReduceOpInterface reduce : valueReduceListMap.lookup(memory))
+      memoryDesc.writes.emplace_back(gatherWriteDesc(reduce));
 
     if (isMemoryWorthLayoutChange(memoryDesc))
       worthLayoutChange.emplace_back(std::move(memoryDesc));
   }
-
+  // Generate new layout and materialize it by converting operations
+  // or creating reorder.
   for (MemoryUsageDesc &memoryDesc : worthLayoutChange) {
     IVLOG(3, "Optimizing layout for " << mlir::debugString(memoryDesc.value));
-    IVLOG(3, "map: " << mlir::debugString(memoryDesc.reads.front().readMap));
     // Select new layout.
     mlir::Optional<ReorderDesc> optReorderDesc =
         generateLayoutChange(memoryDesc);
     if (!optReorderDesc.hasValue()) {
-      IVLOG(3, "Layout already optimal");
+      IVLOG(3, "Could not select more optimal layout");
       continue;
     }
     ReorderDesc &reorderDesc = optReorderDesc.getValue();
     IVLOG(3, "Optimized layout: " << mlir::debugString(reorderDesc.reorderMap));
     // Materialize layout change.
-    foldOrCreateReorder(memoryDesc, optReorderDesc.getValue());
+    foldOrCreateReorder(memoryDesc, reorderDesc, /*allowReorder=*/true);
   }
 }
 
 MemoryReadDesc gatherReadDesc(PxaReadOpInterface op) {
   mlir::MemRefType memRefType = op.getMemRefType();
   mlir::ArrayRef<int64_t> shapeRef = memRefType.getShape();
-  mlir::SmallVector<uint64_t, 4> readVec(shapeRef.size(), 1);
-  mlir::SmallVector<uint64_t, 6> dimensionLowerBounds;
-  mlir::SmallVector<uint64_t, 6> dimensionUpperBounds;
+  mlir::SmallVector<int64_t, 4> readVec(shapeRef.size(), 1);
+  if (auto vecRead = mlir::dyn_cast<PxaVectorLoadOp>(op.getOperation())) {
+    auto vecType = vecRead.getType().cast<mlir::VectorType>();
+    mlir::ArrayRef<int64_t> vecShape = vecType.getShape();
+    for (unsigned idx = 0; idx < vecShape.size(); ++idx)
+      readVec[readVec.size() - vecShape.size() + idx] = vecShape[idx];
+  }
+  mlir::AffineMap readMap = op.getAffineMap();
+  mlir::Operation::operand_range mapOperands = op.getMapOperands();
+  mlir::FlatAffineConstraints dimensionConstraints =
+      gatherAffineMapConstraints(mlir::AffineValueMap(readMap, mapOperands));
   mlir::SmallVector<unsigned, 6> iterationOrder;
   mlir::SmallVector<mlir::BlockArgument, 6> argsOrder;
   unsigned idx = 0;
-  for (mlir::Value dimVal : op.getMapOperands()) {
+  for (mlir::Value dimVal : mapOperands) {
     auto arg = dimVal.dyn_cast<mlir::BlockArgument>();
     mlir::Operation *parent = arg.getOwner()->getParentOp();
-    if (auto parallelOp = mlir::dyn_cast<mlir::AffineParallelOp>(parent)) {
-      mlir::AffineExpr lower =
-          parallelOp.getLowerBoundsValueMap().getResult(arg.getArgNumber());
-      if (auto lowerConst = lower.dyn_cast<mlir::AffineConstantExpr>())
-        dimensionLowerBounds.push_back(lowerConst.getValue());
-      else
-        dimensionLowerBounds.push_back(0);
-
-      mlir::AffineExpr upper =
-          parallelOp.getUpperBoundsValueMap().getResult(arg.getArgNumber());
-      if (auto upperConst = upper.dyn_cast<mlir::AffineConstantExpr>())
-        dimensionUpperBounds.push_back(upperConst.getValue());
-      else
-        dimensionUpperBounds.push_back(-1);
-    }
     auto iterationIt = iterationOrder.begin();
     auto ordIt = argsOrder.begin();
     while (ordIt != argsOrder.end()) {
@@ -369,88 +358,240 @@ MemoryReadDesc gatherReadDesc(PxaReadOpInterface op) {
     iterationOrder.insert(iterationIt, idx);
     idx++;
   }
-  return MemoryReadDesc{op,
-                        op.getAffineMap(),
-                        std::move(readVec),
-                        std::move(dimensionLowerBounds),
-                        std::move(dimensionUpperBounds),
+
+  auto topLevelParallel = op.getParentOfType<mlir::AffineParallelOp>();
+  while (auto nextLevelParallel =
+             topLevelParallel.getParentOfType<mlir::AffineParallelOp>())
+    topLevelParallel = nextLevelParallel;
+  // Fixup for sub-group size equal to 1. Backend will subgroup along
+  // first parallel dimension, so it needs to be moved to the front.
+  if (getIntegerTag(topLevelParallel, subgroupSizeTag(), 1) == 1 &&
+      iterationOrder.size() >= 2) {
+    unsigned subGrouped = iterationOrder.front();
+    iterationOrder.erase(iterationOrder.begin());
+    iterationOrder.push_back(subGrouped);
+  }
+
+  return MemoryReadDesc{op, op.getAffineMap(), std::move(readVec),
+                        std::move(dimensionConstraints),
                         std::move(iterationOrder)};
+}
+
+MemoryWriteDesc gatherWriteDesc(PxaReduceOpInterface op) {
+  mlir::MemRefType memRefType = op.getMemRefType();
+  mlir::ArrayRef<int64_t> shapeRef = memRefType.getShape();
+  mlir::SmallVector<int64_t, 4> reduceVec(shapeRef.size(), 1);
+  if (auto vecReduce = mlir::dyn_cast<PxaVectorReduceOp>(op.getOperation())) {
+    auto vecType = vecReduce.getVectorType();
+    mlir::ArrayRef<int64_t> vecShape = vecType.getShape();
+    for (unsigned idx = 0; idx < vecShape.size(); ++idx)
+      reduceVec[reduceVec.size() - vecShape.size() + idx] = vecShape[idx];
+  }
+  return MemoryWriteDesc{std::move(reduceVec)};
 }
 
 MemoryUsageDesc getEmptyUsageDesc(mlir::Value memory) {
   auto memoryType = memory.getType().cast<mlir::MemRefType>();
   mlir::ArrayRef<int64_t> shapeRef = memoryType.getShape();
-  mlir::SmallVector<uint64_t, 4> shape;
-  for (const int64_t &sh : shapeRef)
-    shape.push_back(static_cast<uint64_t>(sh));
-  return MemoryUsageDesc{memory, shape};
+  mlir::SmallVector<int64_t, 4> shape(shapeRef.begin(), shapeRef.end());
+  auto desc = MemoryUsageDesc{memory, shape};
+  desc.count = std::accumulate(shapeRef.begin(), shapeRef.end(),
+                               /*init=*/(int64_t)1, std::multiplies<int64_t>());
+  return desc;
 }
 
-bool isReadWorthLayoutChange(MemoryReadDesc &desc, uint64_t totalSize) {
+bool isReadWorthLayoutChange(MemoryReadDesc &desc, int64_t totalSize) {
   // Read using only one variable can't really be reordered.
   if (desc.readMap.getNumInputs() == 1)
     return false;
-  uint64_t readCount = 1;
-  for (unsigned idx = 0; idx < desc.dimensionLowerBounds.size(); ++idx) {
-    const uint64_t &lower = desc.dimensionLowerBounds[idx];
-    const uint64_t &upper = desc.dimensionUpperBounds[idx];
-    readCount *= upper - lower;
-  }
-  if (auto shapedResult =
-          desc.readOp.getValue().getType().dyn_cast<mlir::ShapedType>())
-    readCount *= shapedResult.getNumElements();
-  return readCount > totalSize;
+  return true;
+  // TODO: Below code will reject weights for convolutions, we should
+  //       reorder constant data even if it has low in-thread reuse.
+  // uint64_t readCount = 1;
+  // for (unsigned idx = 0; idx < desc.dimensionConstraints.getNumDimIds();
+  // ++idx) {
+  //   mlir::Optional<int64_t> lower =
+  //   desc.dimensionConstraints.getConstantLowerBound(idx);
+  //   mlir::Optional<int64_t> upper =
+  //   desc.dimensionConstraints.getConstantUpperBound(idx);
+  //
+  //   readCount *= (upper.getValue() - lower.getValue());
+  // }
+  // if (auto shapedResult =
+  //         desc.readOp.getValue().getType().dyn_cast<mlir::ShapedType>())
+  //   readCount *= shapedResult.getNumElements();
+  // return readCount > totalSize;
 }
 
 bool isMemoryWorthLayoutChange(MemoryUsageDesc &desc) {
-  uint64_t totalSize =
-      std::accumulate(desc.shape.begin(), desc.shape.end(),
-                      /*init=*/(uint64_t)1, std::multiplies<uint64_t>());
   for (MemoryReadDesc &readDesc : desc.reads) {
-    if (isReadWorthLayoutChange(readDesc, totalSize))
+    if (isReadWorthLayoutChange(readDesc, desc.count))
       return true;
   }
   return false;
 }
 
-mlir::Optional<ReorderDesc>
-generateLayoutChange(const MemoryUsageDesc &memoryDesc) {
-  const MemoryReadDesc &readDesc = memoryDesc.reads.front();
-  // TODO: Fill constraints with upper and lower bounds of read dimensions.
-  mlir::IntegerSet constraints;
-  return tileAffineMap(readDesc.readMap, memoryDesc.shape, readDesc.readVector,
-                       constraints, readDesc.iterationOrder);
+mlir::LogicalResult selectCommonVectorization(MemoryUsageDesc &memoryDesc,
+                                              mlir::ArrayRef<int64_t> &result) {
+  bool isResultUnit = false;
+  auto isUnitVector = [](mlir::ArrayRef<int64_t> vec) {
+    return std::all_of(vec.begin(), vec.end(),
+                       [](int64_t val) { return val == 1; });
+  };
+
+  for (MemoryReadDesc &readDesc : memoryDesc.reads) {
+    mlir::ArrayRef<int64_t> readVector = readDesc.readVector;
+    if (result.empty() || isResultUnit) {
+      result = readVector;
+      isResultUnit = isUnitVector(readVector);
+      continue;
+    }
+    if (isUnitVector(readVector))
+      continue;
+    if (!std::equal(result.begin(), result.end(), readVector.begin()))
+      return mlir::failure();
+  }
+  for (MemoryWriteDesc &writeDesc : memoryDesc.writes) {
+    mlir::ArrayRef<int64_t> writeVector = writeDesc.writeVector;
+    if (result.empty() || isResultUnit) {
+      result = writeVector;
+      isResultUnit = isUnitVector(writeVector);
+      continue;
+    }
+    if (isUnitVector(writeVector))
+      continue;
+    if (!std::equal(result.begin(), result.end(), writeVector.begin()))
+      return mlir::failure();
+  }
+  return mlir::success();
 }
 
-void foldOrCreateReorder(const MemoryUsageDesc &memoryDesc,
-                         const ReorderDesc &reorderDesc) {
-  // TODO: Implement.
-  // Create new memory with desired shape.
-  // Try to replace operations writing to old memory with new modified memory
-  // and transformed affine map. If this fails insert explicit reorder
-  // operation. Replace read operations with new memory, new vector shape and
-  // transformed affine map.
+mlir::Optional<ReorderDesc> generateLayoutChange(MemoryUsageDesc &memoryDesc) {
+  mlir::Optional<ReorderDesc> selectedReorder = llvm::None;
+  mlir::ArrayRef<int64_t> commonVector;
+  if (mlir::failed(selectCommonVectorization(memoryDesc, commonVector))) {
+    IVLOG(3, "  Inconsistent vectorization between reads and writes");
+    return llvm::None;
+  }
+  for (MemoryReadDesc &readDesc : memoryDesc.reads) {
+    if (!isReadWorthLayoutChange(readDesc, memoryDesc.count))
+      continue;
+    mlir::Optional<ReorderDesc> reorder =
+        tileAffineMap(readDesc.readMap, memoryDesc.shape, commonVector,
+                      readDesc.dimensionConstraints, readDesc.iterationOrder);
+    if (!reorder.hasValue())
+      return llvm::None;
+    if (!selectedReorder.hasValue()) {
+      selectedReorder = reorder;
+      continue;
+    }
+    if (selectedReorder.getValue().reorderMap !=
+        reorder.getValue().reorderMap) {
+      IVLOG(3, "  Inconsistent layout between reads");
+      return llvm::None;
+    }
+  }
+  return selectedReorder;
 }
 
-mlir::AffineMap simplifyConstrainedAffineMap(mlir::AffineMap map,
-                                             mlir::IntegerSet constraints) {
-  // TODO: Implement, identity for now.
-  return map;
+void foldOrCreateReorder(MemoryUsageDesc &memoryDesc, ReorderDesc &reorderDesc,
+                         bool allowReorder) {
+  if (mlir::succeeded(convertMemoryLayout(memoryDesc.value, reorderDesc)))
+    return;
+  if (!allowReorder) {
+    IVLOG(3,
+          "  Failed to change layout in-place, separate reorder not allowed");
+    return;
+  }
+  IVLOG(3, "  Failed to change layout in-place, inserting reorder");
+  mlir::DenseSet<mlir::Value> memoryToReorder;
+  for (MemoryReadDesc &readDesc : memoryDesc.reads) {
+    PxaReadOpInterface readOp = readDesc.readOp;
+    mlir::Value readMem = readOp.getMemRef();
+    memoryToReorder.insert(readMem);
+  }
+  for (mlir::Value reorderMem : memoryToReorder) {
+    mlir::OpBuilder builder(reorderMem.getContext());
+    builder.setInsertionPointAfterValue(reorderMem);
+    // TODO: It should be fused location of all reads.
+    reorderMemoryLayoutForReading(reorderMem.getLoc(), builder, reorderDesc,
+                                  reorderMem);
+  }
 }
 
-ReorderDesc expandAffineMap(mlir::AffineMap map, mlir::ArrayRef<uint64_t> shape,
-                            mlir::ArrayRef<uint64_t> vector,
-                            mlir::IntegerSet constraints) {
-  // TODO: Implement, identity for now.
-  auto reorderMap = mlir::AffineMap::getMultiDimIdentityMap(map.getNumResults(),
-                                                            map.getContext());
-  mlir::SmallVector<uint64_t, 6> reorderedShape(shape.begin(), shape.end());
-  mlir::SmallVector<uint64_t, 6> reorderedVector(vector.begin(), vector.end());
-  return ReorderDesc{reorderMap, reorderedShape, reorderedVector};
+void expandAffineExpr(mlir::AffineExpr expr, mlir::AffineExpr dimExpr,
+                      int64_t dimSize, int64_t vecSize,
+                      mlir::FlatAffineConstraints &constraints,
+                      mlir::SmallVectorImpl<mlir::AffineExpr> &expansionExprs,
+                      mlir::SmallVectorImpl<int64_t> &expandedShape,
+                      mlir::SmallVectorImpl<int64_t> &expandedVec) {
+  auto ceilDiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+  if (vecSize != 1) {
+    expandAffineExpr(expr.floorDiv(vecSize), dimExpr.floorDiv(vecSize),
+                     ceilDiv(dimSize, vecSize), 1, constraints, expansionExprs,
+                     expandedShape, expandedVec);
+    expansionExprs.push_back(dimExpr % vecSize);
+    expandedShape.push_back(vecSize);
+    expandedVec.push_back(vecSize);
+    return;
+  }
+  if (expr.getKind() == mlir::AffineExprKind::Add) {
+    auto addExpr = expr.cast<mlir::AffineBinaryOpExpr>();
+    mlir::AffineExpr lhsExpr = addExpr.getLHS();
+    mlir::AffineExpr rhsExpr = addExpr.getRHS();
+    mlir::Optional<int64_t> lhsUpperBound = getUpperBound(lhsExpr, constraints);
+    mlir::Optional<int64_t> rhsUpperBound = getUpperBound(rhsExpr, constraints);
+
+    // Pattern e*i* + e*j*, where e*i* % N == 0 and e*j* < N.
+    mlir::Optional<bool> caseRhsSmaller = rhsUpperBound.map(
+        [&](int64_t val) { return lhsExpr.isMultipleOf(val + 1); });
+    // Pattern e*i* + e*j*, where e*i* < N and e*j* % N == 0.
+    mlir::Optional<bool> caseLhsSmaller = lhsUpperBound.map(
+        [&](int64_t val) { return rhsExpr.isMultipleOf(val + 1); });
+
+    if (caseRhsSmaller.getValueOr(false)) {
+      int64_t divisor = rhsUpperBound.getValue() + 1;
+      expandAffineExpr(lhsExpr.floorDiv(divisor), dimExpr.floorDiv(divisor),
+                       ceilDiv(dimSize, divisor), vecSize, constraints,
+                       expansionExprs, expandedShape, expandedVec);
+      expandAffineExpr(rhsExpr, dimExpr % divisor, divisor, vecSize,
+                       constraints, expansionExprs, expandedShape, expandedVec);
+      return;
+    }
+    if (caseLhsSmaller.getValueOr(false)) {
+      int64_t divisor = lhsUpperBound.getValue() + 1;
+      expandAffineExpr(rhsExpr.floorDiv(divisor), dimExpr.floorDiv(divisor),
+                       ceilDiv(dimSize, divisor), vecSize, constraints,
+                       expansionExprs, expandedShape, expandedVec);
+      expandAffineExpr(lhsExpr, dimExpr % divisor, divisor, vecSize,
+                       constraints, expansionExprs, expandedShape, expandedVec);
+      return;
+    }
+  }
+
+  expansionExprs.push_back(dimExpr);
+  expandedShape.push_back(dimSize);
+  expandedVec.push_back(vecSize);
 }
 
-ReorderDesc sortAffineMap(mlir::AffineMap map, mlir::ArrayRef<uint64_t> shape,
-                          mlir::ArrayRef<uint64_t> vector,
+ReorderDesc expandAffineMap(mlir::AffineMap map, mlir::ArrayRef<int64_t> shape,
+                            mlir::ArrayRef<int64_t> vector,
+                            mlir::FlatAffineConstraints &constraints) {
+  mlir::SmallVector<mlir::AffineExpr, 6> expansionExprs;
+  mlir::SmallVector<int64_t, 6> expandedShape;
+  mlir::SmallVector<int64_t, 6> expandedVec;
+  for (unsigned idx = 0; idx < map.getNumResults(); ++idx) {
+    mlir::AffineExpr dimExpr = mlir::getAffineDimExpr(idx, map.getContext());
+    expandAffineExpr(map.getResult(idx), dimExpr, shape[idx], vector[idx],
+                     constraints, expansionExprs, expandedShape, expandedVec);
+  }
+  auto reorderMap = mlir::AffineMap::get(map.getNumResults(), 0, expansionExprs,
+                                         map.getContext());
+  return ReorderDesc{reorderMap, expandedShape, expandedVec};
+}
+
+ReorderDesc sortAffineMap(mlir::AffineMap map, mlir::ArrayRef<int64_t> shape,
+                          mlir::ArrayRef<int64_t> vector,
                           mlir::ArrayRef<unsigned> schedule) {
   // Small trick with order induced by norm for sorting.
   // For schedule <s0, s1, s2, .., s*n*>, each expression can be thought
@@ -502,32 +643,34 @@ ReorderDesc sortAffineMap(mlir::AffineMap map, mlir::ArrayRef<uint64_t> shape,
 
   auto reorderMap =
       mlir::AffineMap::getPermutationMap(dimsPermutation, map.getContext());
-  mlir::SmallVector<uint64_t, 6> reorderedShape;
-  mlir::SmallVector<uint64_t, 6> reorderedVector;
+  mlir::SmallVector<int64_t, 6> sortedShape;
+  mlir::SmallVector<int64_t, 6> sortedVec;
   for (unsigned perm : dimsPermutation) {
-    reorderedShape.push_back(shape[perm]);
-    reorderedVector.push_back(vector[perm]);
+    sortedShape.push_back(shape[perm]);
+    sortedVec.push_back(vector[perm]);
   }
-  return ReorderDesc{reorderMap, reorderedShape, reorderedVector};
+  return ReorderDesc{reorderMap, sortedShape, sortedVec};
 }
 
-mlir::Optional<ReorderDesc> tileAffineMap(mlir::AffineMap map,
-                                          mlir::ArrayRef<uint64_t> shape,
-                                          mlir::ArrayRef<uint64_t> vector,
-                                          mlir::IntegerSet constraints,
-                                          mlir::ArrayRef<unsigned> schedule) {
-  ReorderDesc expansion = expandAffineMap(map, shape, vector, constraints);
-  mlir::AffineMap expanded = map.compose(expansion.reorderMap);
+mlir::Optional<ReorderDesc>
+tileAffineMap(mlir::AffineMap map, mlir::ArrayRef<int64_t> shape,
+              mlir::ArrayRef<int64_t> vector,
+              mlir::FlatAffineConstraints constraints,
+              mlir::ArrayRef<unsigned> schedule) {
+  ReorderDesc expand = expandAffineMap(map, shape, vector, constraints);
+  mlir::AffineMap expanded = expand.reorderMap.compose(map);
   mlir::AffineMap expandedSimple =
-      simplifyConstrainedAffineMap(expanded, constraints);
-  ReorderDesc sort = sortAffineMap(expandedSimple, expansion.reorderedShape,
-                                   expansion.reorderedVector, schedule);
+      simplifyMapWithConstraints(expanded, constraints);
+  mlir::ArrayRef<int64_t> expandedShape = expand.reorderedShape;
+  mlir::ArrayRef<int64_t> expandedVector = expand.reorderedVector;
+  ReorderDesc sort =
+      sortAffineMap(expandedSimple, expandedShape, expandedVector, schedule);
   // Only sorting can change actual layout, expansion preserves indices after
   // linearization to 1D.
   if (sort.reorderMap.isIdentity())
     return llvm::None;
 
-  return ReorderDesc{expansion.reorderMap.compose(sort.reorderMap),
+  return ReorderDesc{sort.reorderMap.compose(expand.reorderMap),
                      sort.reorderedShape, sort.reorderedVector};
 }
 

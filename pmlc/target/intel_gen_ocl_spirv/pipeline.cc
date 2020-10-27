@@ -62,8 +62,6 @@ void pipelineBuilder(OpPassManager &pm) {
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 
-  pm.addPass(pxa::createReorderLayoutPass());
-
   // Do tiled fusion
   pm.addPass(pxa::createFusionPass(/*memoryActivityThreshold=*/0,
                                    /*exactlyMatch=*/false, /*tiledFusion=*/true,
@@ -78,6 +76,9 @@ void pipelineBuilder(OpPassManager &pm) {
   pm.addPass(pxa::createAffineNormalizePass());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
+
+  pm.addPass(pxa::createReorderLayoutPass());
+  pm.addPass(pxa::createSimplifyWithConstraintsPass());
 
   // Assign GPU blocks + threads to outermost loop
   pm.addPass(pmlc::dialect::pxa::createGPUThreadPass(/*maxThreads=*/64));

@@ -160,6 +160,11 @@ def Vectorize : FunctionPass<"pxa-vectorize"> {
   ];
 }
 
+def SimplifyWithConstraints : FunctionPass<"pxa-simplify-with-constraints"> {
+  let summary = "TODO";
+  let constructor = "pmlc::dialect::pxa::createSimplifyWithConstraintsPass()";
+}
+
 def ReorderLayout : FunctionPass<"pxa-reorder-layout"> {
   let summary = "TODO";
   let constructor = "pmlc::dialect::pxa::createReorderLayoutPass()";
